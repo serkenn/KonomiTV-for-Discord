@@ -1,0 +1,17 @@
+{
+  "name": "konomitv-for-discord",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "KonomiTV のライブ放送を Discord アクティビティで見るための中継サーバーとプレイヤー",
+  "scripts": {
+    "start": "node server/index.mjs",
+    "build": "npm --prefix client run build"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "ws": "^8.23.0"
+  }
+}

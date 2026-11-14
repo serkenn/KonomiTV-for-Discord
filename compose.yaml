@@ -1,0 +1,16 @@
+# KonomiTV for Discord。cloudflared-tv (host ネットワーク) から http://127.0.0.1:7100 で届く。
+services:
+  konomitv-discord:
+    build: .
+    image: konomitv-discord
+    container_name: konomitv-discord
+    restart: always
+    # KonomiTV と cloudflared が host ネットワークなので合わせる。待ち受けは 127.0.0.1 のみ。
+    network_mode: host
+    env_file: .env
+    environment:
+      TZ: Asia/Tokyo
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>KonomiTV for Discord</title>
+  </head>
+  <body>
+    <div id="app">
+      <main class="stage" id="stage">
+        <video id="video" playsinline></video>
+
+        <div class="overlay overlay--center" id="status">
+          <div class="spinner" id="spinner"></div>
+          <p id="status-text">起動しています…</p>
+        </div>
+
+        <button class="unmute" id="unmute" hidden>🔇 クリックで音声をオン</button>
+
+        <header class="topbar" id="topbar">
+          <img class="topbar__logo" id="now-logo" alt="" hidden />
+          <div class="topbar__text">
+            <div class="topbar__channel" id="now-channel"></div>
+            <div class="topbar__title" id="now-title"></div>
+          </div>
+          <div class="members" id="members"></div>
+        </header>
+
+        <footer class="controls" id="controls">
+          <button class="icon-btn" id="mute" title="ミュート">🔊</button>
+          <input class="volume" id="volume" type="range" min="0" max="1" step="0.01" value="1" aria-label="音量" />
+          <span class="controls__spacer"></span>
+          <label class="sync" title="オンにすると、誰かがチャンネルを変えたとき全員が同じチャンネルに切り替わります">
+            <input type="checkbox" id="sync" checked />
+            <span>みんなと同じチャンネル</span>
+          </label>
+          <select class="select" id="quality" aria-label="画質"></select>
+          <button class="icon-btn" id="toggle-list" title="チャンネル一覧">☰</button>
+        </footer>
+      </main>
+
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar__head">チャンネル</div>
+        <ul class="channels" id="channels"></ul>
+      </aside>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
