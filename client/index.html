@@ -27,22 +27,34 @@
         </header>
 
         <footer class="controls" id="controls">
+          <button class="icon-btn" id="play" title="再生 / 一時停止 (スペース)" hidden>⏸</button>
           <button class="icon-btn" id="mute" title="ミュート">🔊</button>
           <input class="volume" id="volume" type="range" min="0" max="1" step="0.01" value="1" aria-label="音量" />
+          <span class="time" id="time" hidden></span>
           <span class="controls__spacer"></span>
-          <label class="sync" title="オンにすると、誰かがチャンネルを変えたとき全員が同じチャンネルに切り替わります">
+          <input class="seek" id="seek" type="range" min="0" max="1" step="1" value="0" aria-label="再生位置" hidden />
+          <label class="sync" title="オンにすると、誰かがチャンネルや録画を切り替えたり、録画を再生・一時停止・シークしたりしたとき、全員がそろいます">
             <input type="checkbox" id="sync" checked />
-            <span>みんなと同じチャンネル</span>
+            <span>みんなと一緒に見る</span>
           </label>
           <select class="select" id="quality" aria-label="画質"></select>
+          <select class="select select--source" id="source" aria-label="配信形式" hidden></select>
           <button class="icon-btn icon-btn--d" id="toggle-remote" title="データ放送 (d ボタン)" aria-pressed="false">d</button>
           <button class="icon-btn" id="toggle-list" title="チャンネル一覧">☰</button>
         </footer>
       </main>
 
       <aside class="sidebar" id="sidebar">
-        <div class="sidebar__head">チャンネル</div>
+        <div class="sidebar__head" id="side-title">チャンネル</div>
+        <div class="tabs" id="tabs" role="tablist" hidden>
+          <button class="tab is-active" id="tab-live" role="tab" aria-selected="true">放送中</button>
+          <button class="tab" id="tab-rec" role="tab" aria-selected="false">録画</button>
+        </div>
         <ul class="channels" id="channels"></ul>
+        <div class="recorded" id="recorded-box" hidden>
+          <input class="search" id="rec-search" type="search" placeholder="録画を検索（Enter）" aria-label="録画を検索" />
+          <ul class="channels" id="recorded"></ul>
+        </div>
         <section class="remote" id="remote" hidden aria-label="データ放送のリモコン">
           <div class="remote__status" id="remote-status"></div>
           <div class="remote__row">

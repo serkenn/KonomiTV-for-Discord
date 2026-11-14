@@ -1,5 +1,6 @@
 // KonomiTV for Discord — 中継サーバー
-// 役割: Discord の OAuth コード交換 / 視聴許可の判定 / KonomiTV API とライブ映像の中継 / チャンネル同期 (WebSocket)
+// 役割: Discord の OAuth コード交換 / 視聴許可の判定 / KonomiTV のライブ映像とデータ放送の中継 /
+//       EPGStation の録画の中継 / チャンネルと録画の同期 (WebSocket)
 import { createServer } from 'node:http';
 import { randomBytes } from 'node:crypto';
 import { createReadStream } from 'node:fs';
@@ -13,6 +14,8 @@ const env = process.env;
 const PORT = Number(env.PORT || 7100);
 const HOST = env.HOST || '127.0.0.1';
 const KONOMITV_URL = (env.KONOMITV_URL || 'https://127-0-0-1.local.konomi.tv:7000').replace(/\/+$/, '');
+// 録画の一覧と再生は EPGStation から取る。空にすると録画タブを出さない。
+const EPGSTATION_URL = (env.EPGSTATION_URL ?? 'http://127.0.0.1:8888').trim().replace(/\/+$/, '');
 const CLIENT_ID = (env.DISCORD_CLIENT_ID || '').trim();
 const CLIENT_SECRET = (env.DISCORD_CLIENT_SECRET || '').trim();
 const list = v => (v || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -28,13 +31,16 @@ if (DEV_NO_AUTH && HOST !== '127.0.0.1') {
 const QUALITIES = ['1080p', '720p', '540p', '480p', '360p', '240p'];
 const CHANNEL_ID_RE = /^[a-z0-9]{2,8}(-[0-9]{1,2})?$/;
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
-// 映像とデータ放送で 1 人 2 本。チャンネル切り替え中は一時的に倍になる
+// 映像 (録画の変換配信を含む) とデータ放送で 1 人 2 本。切り替え中は一時的に倍になる
 const MAX_STREAMS_PER_SESSION = 6;
 const DIST = join(dirname(fileURLToPath(import.meta.url)), '..', 'client', 'dist');
 
 /** @type {Map<string, {user: {id: string, name: string, avatar: string | null}, exp: number, streams: number}>} */
 const sessions = new Map();
-/** @type {Map<string, {channel: string | null, by: string | null, clients: Set<import('ws').WebSocket>}>} */
+/**
+ * channel: みんなで見ている放送中のチャンネル。rec: みんなで見ている録画 (どちらか一方)。
+ * @type {Map<string, {channel: string | null, rec: object | null, by: string | null, clients: Set<import('ws').WebSocket>}>}
+ */
 const rooms = new Map();
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -246,6 +252,174 @@ async function handleStream(req, res, session, id, quality, kind = 'mpegts') {
     }
 }
 
+// ---------- 録画 (EPGStation) ----------
+
+/** 録画ファイル ID -> 直接配信してよいファイルか。一覧や 1 件取得で返したファイルを覚えておく */
+const recFiles = new Map();
+let recFilesRefreshedAt = 0;
+/** チャンネル名と、その場で変換するときに選べる画質の一覧 */
+let epgMeta = { at: 0, channels: new Map(), modes: {} };
+
+async function epgJson(path) {
+    const r = await fetch(`${EPGSTATION_URL}${path}`, { signal: AbortSignal.timeout(10000) });
+    if (!r.ok) throw Object.assign(new Error(`EPGStation ${path} -> ${r.status}`), { status: r.status });
+    return r.json();
+}
+
+async function ensureEpgMeta() {
+    if (Date.now() - epgMeta.at < 10 * 60 * 1000) return;
+    const [channels, config] = await Promise.all([epgJson('/api/channels'), epgJson('/api/config')]);
+    epgMeta = {
+        at: Date.now(),
+        channels: new Map(channels.map(c => [c.id, c.halfWidthName || c.name])),
+        modes: config.streamConfig?.recorded ?? {},
+    };
+}
+
+function rememberFile(v) {
+    const ext = (v.filename ?? '').toLowerCase().match(/\.(mp4|webm)$/)?.[1] ?? null;
+    // ブラウザがそのまま再生できるのは、エンコード済みの mp4 / webm だけ
+    const direct = v.type === 'encoded' && ext !== null;
+    recFiles.set(v.id, { direct });
+    return { id: v.id, type: v.type, name: v.name, size: v.size, direct, ext };
+}
+
+function shapeRecord(r) {
+    return {
+        id: r.id,
+        name: r.name,
+        description: r.description ?? '',
+        start: r.startAt,
+        end: r.endAt,
+        channel: epgMeta.channels.get(r.channelId) ?? '',
+        recording: !!r.isRecording,
+        thumbnail: r.thumbnails?.[0] ?? null,
+        files: (r.videoFiles ?? []).map(rememberFile),
+    };
+}
+
+async function handleRecordedList(res, url) {
+    const offset = Math.max(0, Math.floor(Number(url.searchParams.get('offset')) || 0));
+    const keyword = (url.searchParams.get('keyword') || '').trim().slice(0, 100);
+    await ensureEpgMeta();
+    const query = new URLSearchParams({ isHalfWidth: 'true', offset: String(offset), limit: '30' });
+    if (keyword) query.set('keyword', keyword);
+    const raw = await epgJson(`/api/recorded?${query}`);
+    sendJson(res, 200, { records: raw.records.map(shapeRecord), total: raw.total, modes: epgMeta.modes });
+}
+
+/** 1 件だけ返す。ほかの人が再生した録画が、自分の一覧 (検索中や未読み込みの続き) にないときに使う */
+async function handleRecordedItem(res, id) {
+    await ensureEpgMeta();
+    try {
+        const raw = await epgJson(`/api/recorded/${id}?isHalfWidth=true`);
+        sendJson(res, 200, { record: shapeRecord(raw), modes: epgMeta.modes });
+    } catch (e) {
+        if (e.status === 404) return sendJson(res, 404, { error: 'not_found' });
+        throw e;
+    }
+}
+
+/**
+ * 配信してよい録画ファイルか。一覧を経由せずに来たとき (サーバー再起動直後など) は全件を引き直して確かめる。
+ * 存在しない ID を何度も送られても EPGStation を叩きすぎないよう、引き直しは 30 秒に 1 回まで。
+ */
+async function knownRecFile(id) {
+    if (!recFiles.has(id) && Date.now() - recFilesRefreshedAt > 30 * 1000) {
+        recFilesRefreshedAt = Date.now();
+        const raw = await epgJson('/api/recorded?isHalfWidth=true&offset=0&limit=1000');
+        for (const r of raw.records) for (const v of r.videoFiles ?? []) rememberFile(v);
+    }
+    return recFiles.get(id) ?? null;
+}
+
+/** 途中から録画したものは番組表の長さより短いので、ファイルの実際の長さを返す */
+async function handleRecordedDuration(res, id) {
+    if (!(await knownRecFile(id))) return sendJson(res, 404, { error: 'not_found' });
+    const d = await epgJson(`/api/videos/${id}/duration`);
+    sendJson(res, 200, { duration: Number(d.duration) || 0 });
+}
+
+async function handleRecordedThumbnail(res, id) {
+    const r = await fetch(`${EPGSTATION_URL}/api/thumbnails/${id}`, { signal: AbortSignal.timeout(10000) });
+    if (!r.ok) return void res.writeHead(404).end();
+    const buf = Buffer.from(await r.arrayBuffer());
+    res.writeHead(200, {
+        'Content-Type': r.headers.get('content-type') || 'image/jpeg',
+        'Content-Length': buf.length,
+        'Cache-Control': 'private, max-age=86400',
+    });
+    res.end(buf);
+}
+
+/** 保存済みの mp4 / webm をそのまま流す。シークできるように Range をそのまま通す */
+async function handleRecordedFile(req, res, id) {
+    const file = await knownRecFile(id);
+    if (!file?.direct) return sendJson(res, 404, { error: 'not_found' });
+    const ac = new AbortController();
+    res.on('close', () => ac.abort());
+    const headers = {};
+    if (req.headers.range) headers.Range = req.headers.range;
+    let up;
+    try {
+        up = await fetch(`${EPGSTATION_URL}/api/videos/${id}`, { headers, signal: ac.signal });
+    } catch {
+        // 見ている側が先に切った (シークで取り直したなど) か、EPGStation に届かない
+        if (!res.headersSent) sendJson(res, 502, { error: 'epgstation_unreachable' });
+        return;
+    }
+    if (!up.body || (up.status !== 200 && up.status !== 206)) {
+        return sendJson(res, up.status === 416 ? 416 : 502, { error: 'epgstation_error', status: up.status });
+    }
+    const out = { 'Cache-Control': 'private, no-store', 'Accept-Ranges': 'bytes' };
+    for (const h of ['content-type', 'content-length', 'content-range']) {
+        const v = up.headers.get(h);
+        if (v) out[h] = v;
+    }
+    res.writeHead(up.status, out);
+    const body = Readable.fromWeb(up.body);
+    body.on('error', () => res.destroy());
+    body.pipe(res);
+}
+
+/** TS などを EPGStation にその場で mp4 / webm へ変換させて流す。ss は開始位置 (秒) */
+async function handleRecordedTranscode(res, session, id, format, mode, ss) {
+    if (!(await knownRecFile(id))) return sendJson(res, 404, { error: 'not_found' });
+    if (session.streams >= MAX_STREAMS_PER_SESSION) return sendJson(res, 429, { error: 'too_many_streams' });
+    session.streams++;
+    const ac = new AbortController();
+    let released = false;
+    const release = () => {
+        if (released) return;
+        released = true;
+        session.streams--;
+        ac.abort();
+    };
+    res.on('close', release);
+    try {
+        const up = await fetch(`${EPGSTATION_URL}/api/streams/recorded/${id}/${format}?ss=${ss}&mode=${mode}`, {
+            signal: ac.signal,
+        });
+        if (!up.ok || !up.body) {
+            release();
+            return sendJson(res, 502, { error: 'epgstation_error', status: up.status });
+        }
+        log('recorded start', session.user.name, id, format, mode, `ss=${ss}`);
+        res.writeHead(200, {
+            'Content-Type': format === 'webm' ? 'video/webm' : 'video/mp4',
+            'Cache-Control': 'no-store, no-transform',
+            'X-Accel-Buffering': 'no',
+        });
+        const body = Readable.fromWeb(up.body);
+        body.on('error', () => res.destroy());
+        body.pipe(res);
+    } catch {
+        release();
+        if (!res.headersSent) sendJson(res, 502, { error: 'epgstation_unreachable' });
+        else res.destroy();
+    }
+}
+
 // ---------- 静的ファイル ----------
 
 const MIME = {
@@ -310,6 +484,7 @@ const server = createServer(async (req, res) => {
                 clientId: CLIENT_ID,
                 scopes: ['identify', ...(ALLOWED_GUILDS.size > 0 ? ['guilds'] : [])],
                 dev: DEV_NO_AUTH,
+                recorded: EPGSTATION_URL !== '',
             });
         }
         if (path === '/api/token' && req.method === 'POST') return await handleToken(req, res);
@@ -329,6 +504,22 @@ const server = createServer(async (req, res) => {
         if (m && CHANNEL_ID_RE.test(m[1]) && QUALITIES.includes(m[2])) {
             return await handleStream(req, res, session, m[1], m[2], 'psi-archived-data');
         }
+        if (EPGSTATION_URL && path.startsWith('/api/recorded')) {
+            if (path === '/api/recorded') return await handleRecordedList(res, url);
+            m = path.match(/^\/api\/recorded\/thumbnail\/(\d{1,9})$/);
+            if (m) return await handleRecordedThumbnail(res, Number(m[1]));
+            m = path.match(/^\/api\/recorded\/item\/(\d{1,9})$/);
+            if (m) return await handleRecordedItem(res, Number(m[1]));
+            m = path.match(/^\/api\/recorded\/duration\/(\d{1,9})$/);
+            if (m) return await handleRecordedDuration(res, Number(m[1]));
+            m = path.match(/^\/api\/recorded\/file\/(\d{1,9})$/);
+            if (m) return await handleRecordedFile(req, res, Number(m[1]));
+            m = path.match(/^\/api\/recorded\/stream\/(\d{1,9})\/(mp4|webm)\/([0-9])$/);
+            if (m) {
+                const ss = Math.max(0, Math.floor(Number(url.searchParams.get('ss')) || 0));
+                return await handleRecordedTranscode(res, session, Number(m[1]), m[2], Number(m[3]), ss);
+            }
+        }
         sendJson(res, 404, { error: 'not_found' });
     } catch (e) {
         log('request error', req.url, e.message);
@@ -337,7 +528,7 @@ const server = createServer(async (req, res) => {
     }
 });
 
-// ---------- WebSocket: 同じアクティビティ (instance) の人でチャンネルを揃える ----------
+// ---------- WebSocket: 同じアクティビティ (instance) の人でチャンネルや録画を揃える ----------
 
 const wss = new WebSocketServer({ noServer: true, maxPayload: 4096 });
 
@@ -349,7 +540,13 @@ function broadcast(room) {
         seen.add(c.user.id);
         members.push(c.user);
     }
-    const msg = JSON.stringify({ type: 'state', channel: room.channel, by: room.by, members });
+    // 録画は「いまの再生位置」に直してから配る (あとから入った人もそこから見始められる)
+    let rec = null;
+    if (room.rec) {
+        const elapsed = room.rec.playing ? (Date.now() - room.rec.at) / 1000 : 0;
+        rec = { ...room.rec, pos: room.rec.pos + elapsed, at: undefined };
+    }
+    const msg = JSON.stringify({ type: 'state', channel: room.channel, rec, by: room.by, members });
     for (const c of room.clients) if (c.readyState === 1) c.send(msg);
 }
 
@@ -366,7 +563,7 @@ server.on('upgrade', (req, socket, head) => {
         ws.user = session.user;
         ws.alive = true;
         let room = rooms.get(instance);
-        if (!room) rooms.set(instance, (room = { channel: null, by: null, clients: new Set() }));
+        if (!room) rooms.set(instance, (room = { channel: null, rec: null, by: null, clients: new Set() }));
         room.clients.add(ws);
         broadcast(room);
 
@@ -380,6 +577,20 @@ server.on('upgrade', (req, socket, head) => {
             }
             if (msg?.type === 'select' && typeof msg.channel === 'string' && CHANNEL_ID_RE.test(msg.channel)) {
                 room.channel = msg.channel;
+                room.rec = null;
+                room.by = session.user.name;
+                broadcast(room);
+            } else if (
+                msg?.type === 'rec' &&
+                Number.isSafeInteger(msg.recordedId) &&
+                msg.recordedId > 0 &&
+                Number.isFinite(msg.pos) &&
+                msg.pos >= 0 &&
+                msg.pos < 7 * 24 * 3600
+            ) {
+                // 配信形式 (mp4 / webm など) は各自で選ぶので、そろえるのは録画・位置・再生中かどうかだけ
+                room.channel = null;
+                room.rec = { recordedId: msg.recordedId, pos: msg.pos, playing: msg.playing !== false, at: Date.now() };
                 room.by = session.user.name;
                 broadcast(room);
             }

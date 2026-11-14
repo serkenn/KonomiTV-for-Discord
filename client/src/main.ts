@@ -1,6 +1,7 @@
 import { DiscordSDK } from '@discord/embedded-app-sdk';
 import { DataBroadcast, Key, type DataStatus } from './databroadcast';
 import { LivePlayer, type PlayerState } from './player';
+import { RecordedPlayer, type RecSource } from './recorded';
 import './style.css';
 
 interface Program {
@@ -25,9 +26,40 @@ interface Member {
     name: string;
     avatar: string | null;
 }
+interface RecFile {
+    id: number;
+    type: string;
+    name: string;
+    size: number;
+    /** 保存済みの mp4 / webm で、変換なしにそのまま再生できる */
+    direct: boolean;
+    ext: 'mp4' | 'webm' | null;
+}
+interface RecordItem {
+    id: number;
+    name: string;
+    description: string;
+    start: number;
+    end: number;
+    channel: string;
+    recording: boolean;
+    thumbnail: number | null;
+    files: RecFile[];
+}
+/** その場で変換するときに選べる画質の名前。添字がそのまま画質の番号になる */
+type RecModes = Partial<Record<'ts' | 'encoded', Partial<Record<'mp4' | 'webm', string[]>>>>;
+/** みんなで見ている録画。配信形式は各自で選ぶので含めない */
+interface RecState {
+    recordedId: number;
+    pos: number;
+    playing: boolean;
+}
+/** applyRemoteRec の結果。superseded は、待っているあいだにもっと新しい切り替えがあったこと */
+type ApplyResult = 'applied' | 'failed' | 'superseded';
 interface RoomState {
     type: 'state';
     channel: string | null;
+    rec: RecState | null;
     by: string | null;
     members: Member[];
 }
@@ -61,6 +93,17 @@ const toggleRemoteBtn = $<HTMLButtonElement>('toggle-remote');
 const remoteBox = $('remote');
 const remoteStatus = $('remote-status');
 const remoteDigits = $('remote-digits');
+const playBtn = $<HTMLButtonElement>('play');
+const seekInput = $<HTMLInputElement>('seek');
+const timeLabel = $('time');
+const sourceSelect = $<HTMLSelectElement>('source');
+const sideTitle = $('side-title');
+const tabsBox = $('tabs');
+const tabLive = $<HTMLButtonElement>('tab-live');
+const tabRec = $<HTMLButtonElement>('tab-rec');
+const recordedBox = $('recorded-box');
+const recordedList = $('recorded');
+const recSearch = $<HTMLInputElement>('rec-search');
 
 const store = {
     get(key: string): string | null {
@@ -87,6 +130,21 @@ let room: RoomState | null = null;
 let ws: WebSocket | null = null;
 let initialChosen = false;
 let remoteOn = store.get('remote') === '1';
+/** いま再生しているもの: 放送中か録画か */
+let mode: 'live' | 'rec' = 'live';
+/** サイドバーで開いているタブ */
+let tab: 'live' | 'rec' = 'live';
+let records: RecordItem[] = [];
+let recModes: RecModes = {};
+let recordsLoaded = false;
+let recordsTotal = 0;
+/** 録画一覧の読み込みの通し番号。遅れて返ってきた古い結果を捨てるのに使う */
+let recordsLoadSeq = 0;
+/** 再生中の録画。value は「ファイルID:配信元」 */
+let currentRec: { record: RecordItem; value: string } | null = null;
+let seeking = false;
+/** 選局・録画の切り替えの通し番号。遅れて終わった古い同期の指示を捨てるのに使う */
+let syncSeq = 0;
 
 function setStatus(text: string | null, busy = true): void {
     statusBox.hidden = text === null;
@@ -142,14 +200,343 @@ data.onError = text => toast(text);
 /** いまのチャンネルと画質でデータ放送を始め直す (リモコンを閉じているときは止める) */
 function restartData(): void {
     const ch = channels.find(c => c.id === current);
-    if (remoteOn && ch) data.start(dataUrl(ch.id), ch.service_id);
+    if (remoteOn && ch && mode === 'live') data.start(dataUrl(ch.id), ch.service_id);
     else data.stop();
 }
 
 function renderRemote(): void {
-    remoteBox.hidden = !remoteOn;
+    remoteBox.hidden = !remoteOn || tab !== 'live' || mode !== 'live';
     toggleRemoteBtn.setAttribute('aria-pressed', String(remoteOn));
     toggleRemoteBtn.classList.toggle('is-on', remoteOn);
+}
+
+// ---------- 録画 ----------
+
+const recPlayer = new RecordedPlayer(video);
+
+const two = (n: number) => String(n).padStart(2, '0');
+function clock(seconds: number): string {
+    const s = Math.max(0, Math.floor(seconds));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    return h > 0 ? `${h}:${two(m)}:${two(s % 60)}` : `${m}:${two(s % 60)}`;
+}
+function dateLabel(ms: number): string {
+    const d = new Date(ms);
+    return `${d.getMonth() + 1}/${d.getDate()}(${'日月火水木金土'[d.getDay()]}) ${d.getHours()}:${two(d.getMinutes())}`;
+}
+
+/** 再生を始める。自動再生が止められたらミュートで始めて、音声オンのボタンを出す */
+function playVideo(): void {
+    video.play().catch((err: unknown) => {
+        if (err instanceof DOMException && err.name === 'NotAllowedError' && !video.muted) {
+            video.muted = true;
+            unmuteBtn.hidden = false;
+            renderVolume();
+            video.play().catch(() => {});
+        }
+    });
+}
+
+/** その録画で選べる配信元。保存済みの mp4 / webm を先に、その場での変換を後に並べる */
+function recSources(record: RecordItem): { value: string; label: string }[] {
+    const out: { value: string; label: string }[] = [];
+    const direct = record.files.filter(f => f.direct).sort((a, b) => Number(a.ext !== 'mp4') - Number(b.ext !== 'mp4'));
+    for (const f of direct) {
+        // 同じ形式の保存済みファイルが複数あるときだけ、エンコード設定の名前を添えて見分ける
+        const same = direct.filter(d => d.ext === f.ext).length > 1;
+        out.push({ value: `${f.id}:file`, label: `${f.ext}・保存済み${same ? `（${f.name}）` : ''}` });
+    }
+    const base = record.files.find(f => f.type === 'ts') ?? record.files[0];
+    if (base) {
+        const names = recModes[base.type === 'ts' ? 'ts' : 'encoded'] ?? {};
+        for (const format of ['mp4', 'webm'] as const) {
+            (names[format] ?? []).forEach((name, index) => {
+                out.push({ value: `${base.id}:${format}-${index}`, label: `${format} ${name}・変換` });
+            });
+        }
+    }
+    return out;
+}
+
+function recSource(value: string): RecSource {
+    const [fileId, source] = value.split(':');
+    const token = encodeURIComponent(session);
+    if (source === 'file') return { kind: 'file', url: `${BASE}/api/recorded/file/${fileId}?t=${token}` };
+    const [format, quality] = source.split('-');
+    return {
+        kind: 'transcode',
+        url: start => `${BASE}/api/recorded/stream/${fileId}/${format}/${quality}?ss=${start}&t=${token}`,
+    };
+}
+
+/** 録画一覧を読み込む。append なら続きを読み足す */
+async function loadRecorded(append = false): Promise<void> {
+    const seq = ++recordsLoadSeq;
+    const offset = append ? records.length : 0;
+    const query = new URLSearchParams({ offset: String(offset), keyword: recSearch.value.trim() });
+    const result = await api<{ records: RecordItem[]; total: number; modes: RecModes }>(`/api/recorded?${query}`);
+    if (seq !== recordsLoadSeq) return;
+    const kept = append ? records : [];
+    const known = new Set(kept.map(r => r.id));
+    records = [...kept, ...result.records.filter(r => !known.has(r.id))];
+    recordsTotal = result.total;
+    recModes = result.modes ?? {};
+    recordsLoaded = true;
+    renderRecorded();
+}
+
+/** 一覧にない録画 (検索で絞り込み中や、まだ読み込んでいない続きにあるもの) を 1 件だけ取る */
+async function fetchRecord(id: number): Promise<RecordItem | null> {
+    try {
+        const result = await api<{ record: RecordItem; modes: RecModes }>(`/api/recorded/item/${id}`);
+        recModes = result.modes ?? recModes;
+        return result.record;
+    } catch {
+        return null;
+    }
+}
+
+function renderRecorded(): void {
+    if (records.length === 0) {
+        const empty = document.createElement('li');
+        empty.className = 'channels__empty';
+        empty.textContent = recordsLoaded ? '録画がありません' : '読み込んでいます…';
+        recordedList.replaceChildren(empty);
+        return;
+    }
+    const items = records.map(record => {
+        const li = document.createElement('li');
+        li.className = 'channel' + (currentRec?.record.id === record.id ? ' is-active' : '');
+        li.tabIndex = 0;
+        li.setAttribute('role', 'button');
+
+        if (record.thumbnail !== null) {
+            const thumb = document.createElement('img');
+            thumb.className = 'channel__thumb';
+            thumb.src = `${BASE}/api/recorded/thumbnail/${record.thumbnail}?t=${encodeURIComponent(session)}`;
+            thumb.alt = '';
+            thumb.loading = 'lazy';
+            li.append(thumb);
+        }
+
+        const body = document.createElement('div');
+        body.className = 'channel__body';
+        const title = document.createElement('div');
+        title.className = 'channel__title channel__title--strong';
+        title.textContent = record.name;
+        const meta = document.createElement('div');
+        meta.className = 'channel__time';
+        const minutes = Math.round((record.end - record.start) / 60000);
+        meta.textContent = [dateLabel(record.start), `${minutes}分`, record.channel].filter(Boolean).join('・');
+        const badges = document.createElement('div');
+        badges.className = 'badges';
+        const labels = new Set<string>();
+        if (record.recording) labels.add('録画中');
+        for (const f of record.files) labels.add(f.direct && f.ext ? f.ext : f.type === 'ts' ? 'TS' : f.name);
+        for (const label of labels) {
+            const badge = document.createElement('span');
+            badge.className = 'badge' + (label === '録画中' ? ' badge--live' : '');
+            badge.textContent = label;
+            badges.append(badge);
+        }
+        body.append(title, meta, badges);
+        li.append(body);
+
+        const choose = () => {
+            const first = recSources(record)[0];
+            if (!first) toast('この録画には再生できるファイルがありません');
+            else playRecorded(record, first.value, 0, true, true);
+        };
+        li.addEventListener('click', choose);
+        li.addEventListener('keydown', e => {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                choose();
+            }
+        });
+        return li;
+    });
+
+    if (records.length < recordsTotal) {
+        const li = document.createElement('li');
+        const more = document.createElement('button');
+        more.className = 'more';
+        more.textContent = `さらに表示（残り ${recordsTotal - records.length} 件）`;
+        more.addEventListener('click', () => {
+            more.disabled = true;
+            loadRecorded(true).catch(() => {
+                more.disabled = false;
+                toast('録画一覧を取得できませんでした');
+            });
+        });
+        li.append(more);
+        items.push(li);
+    }
+    recordedList.replaceChildren(...items);
+}
+
+/** 放送中と録画で、操作バーに出すものを切り替える */
+function renderMode(): void {
+    const rec = mode === 'rec';
+    playBtn.hidden = seekInput.hidden = timeLabel.hidden = sourceSelect.hidden = !rec;
+    qualitySelect.hidden = toggleRemoteBtn.hidden = rec;
+    renderRemote();
+    if (!rec || !currentRec) return;
+    const selected = currentRec.value;
+    sourceSelect.replaceChildren(
+        ...recSources(currentRec.record).map(s => {
+            const o = document.createElement('option');
+            o.value = s.value;
+            o.textContent = s.label;
+            o.selected = s.value === selected;
+            return o;
+        }),
+    );
+}
+
+function renderProgress(): void {
+    if (mode !== 'rec') return;
+    const total = recPlayer.duration;
+    playBtn.textContent = video.paused ? '▶' : '⏸';
+    seekInput.max = String(Math.max(1, Math.floor(total)));
+    if (!seeking) seekInput.value = String(Math.floor(recPlayer.position));
+    timeLabel.textContent = `${clock(seeking ? Number(seekInput.value) : recPlayer.position)} / ${clock(total)}`;
+}
+
+/** 自分の再生状態 (どの録画の何秒目か、再生中か) をみんなに伝える */
+function announceRec(playing = !video.paused): void {
+    if (!currentRec || !syncInput.checked || ws?.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'rec', recordedId: currentRec.record.id, pos: recPlayer.position, playing }));
+}
+
+function playRecorded(record: RecordItem, value: string, position: number, playing: boolean, announce: boolean): void {
+    syncSeq++;
+    mode = 'rec';
+    player.stop();
+    data.stop();
+    current = null;
+    currentRec = { record, value };
+    setStatus(`${record.name} を読み込んでいます…`);
+    recPlayer.load(recSource(value), (record.end - record.start) / 1000, position);
+    if (playing) playVideo();
+    if (!value.endsWith(':file')) {
+        // その場で変換する配信は動画から長さが分からないので、サーバーに聞く
+        api<{ duration: number }>(`/api/recorded/duration/${value.split(':')[0]}`)
+            .then(d => {
+                if (currentRec?.value !== value) return;
+                recPlayer.setDuration(d.duration);
+                renderProgress();
+            })
+            .catch(() => {});
+    }
+    renderMode();
+    renderChannels();
+    renderRecorded();
+    renderNow();
+    renderProgress();
+    if (announce) announceRec(playing);
+    if (window.matchMedia('(max-width: 760px)').matches) sidebar.classList.remove('is-open');
+}
+
+/** 録画をやめて放送中の表示に戻す (映像の読み込みは呼び出し側で行う) */
+function leaveRecorded(): void {
+    recPlayer.stop();
+    currentRec = null;
+    mode = 'live';
+    renderMode();
+    renderRecorded();
+}
+
+/**
+ * みんなが見ている録画に合わせる。そろえるのは録画・位置・再生/一時停止で、配信形式 (mp4 / webm など) は各自のまま。
+ */
+async function applyRemoteRec(rec: RecState, by: string | null): Promise<ApplyResult> {
+    const seq = ++syncSeq;
+    if (mode === 'rec' && currentRec?.record.id === rec.recordedId) {
+        // その場で変換する配信はシークすると取り直しになるので、ずれを大きめに許す
+        const tolerance = currentRec.value.endsWith(':file') ? 3 : 8;
+        if (Math.abs(recPlayer.position - rec.pos) > tolerance) recPlayer.seek(rec.pos);
+        if (rec.playing && video.paused) playVideo();
+        else if (!rec.playing && !video.paused) video.pause();
+        return 'applied';
+    }
+    const record = records.find(r => r.id === rec.recordedId) ?? (await fetchRecord(rec.recordedId));
+    // 待っているあいだに別のチャンネルや録画に切り替わっていたら、この指示は古い
+    if (seq !== syncSeq) return 'superseded';
+    const first = record ? recSources(record)[0] : undefined;
+    if (!record || !first) return 'failed';
+    playRecorded(record, first.value, rec.pos, rec.playing, false);
+    if (by) toast(`${by} さんが「${record.name}」を再生しました`);
+    return 'applied';
+}
+
+function showTab(next: 'live' | 'rec'): void {
+    tab = next;
+    tabLive.classList.toggle('is-active', next === 'live');
+    tabRec.classList.toggle('is-active', next === 'rec');
+    tabLive.setAttribute('aria-selected', String(next === 'live'));
+    tabRec.setAttribute('aria-selected', String(next === 'rec'));
+    channelList.hidden = next !== 'live';
+    recordedBox.hidden = next !== 'rec';
+    renderRemote();
+    if (next === 'rec') {
+        renderRecorded();
+        loadRecorded().catch(() => toast('録画一覧を取得できませんでした'));
+    }
+}
+
+function setupRecorded(): void {
+    sideTitle.hidden = true;
+    tabsBox.hidden = false;
+    tabLive.addEventListener('click', () => showTab('live'));
+    tabRec.addEventListener('click', () => showTab('rec'));
+    const reload = () => loadRecorded().catch(() => toast('録画一覧を取得できませんでした'));
+    recSearch.addEventListener('keydown', e => {
+        if (e.key === 'Enter') reload();
+    });
+    // 検索欄を空にしたら全件に戻す
+    recSearch.addEventListener('input', () => {
+        if (recSearch.value === '') reload();
+    });
+
+    playBtn.addEventListener('click', () => {
+        if (video.paused) playVideo();
+        else video.pause();
+        announceRec();
+    });
+    seekInput.addEventListener('input', () => {
+        seeking = true;
+        renderProgress();
+    });
+    seekInput.addEventListener('change', () => {
+        seeking = false;
+        recPlayer.seek(Number(seekInput.value));
+        renderProgress();
+        announceRec();
+    });
+    sourceSelect.addEventListener('change', () => {
+        if (currentRec) playRecorded(currentRec.record, sourceSelect.value, recPlayer.position, !video.paused, true);
+    });
+
+    for (const type of ['timeupdate', 'play', 'pause', 'durationchange'] as const) {
+        video.addEventListener(type, renderProgress);
+    }
+    video.addEventListener('waiting', () => {
+        if (mode === 'rec') setStatus('読み込んでいます…');
+    });
+    // 一時停止のまま読み込んだときは playing が来ないので、再生できる状態になった時点で表示を消す
+    video.addEventListener('canplay', () => {
+        if (mode === 'rec') setStatus(null);
+    });
+    video.addEventListener('error', () => {
+        if (mode === 'rec' && recPlayer.active) setStatus('この録画を再生できませんでした。配信形式を変えてみてください', false);
+    });
+    window.addEventListener('keydown', e => {
+        if (mode !== 'rec' || e.key !== ' ' || (e.target as HTMLElement).closest('input, select, button, [role="button"]')) return;
+        e.preventDefault();
+        playBtn.click();
+    });
 }
 
 // ---------- 表示 ----------
@@ -223,6 +610,13 @@ function renderChannels(): void {
 }
 
 function renderNow(): void {
+    if (mode === 'rec' && currentRec) {
+        const record = currentRec.record;
+        nowLogo.hidden = true;
+        nowChannel.textContent = `録画・${record.channel}`;
+        nowTitle.textContent = `${record.name}（${dateLabel(record.start)}）`;
+        return;
+    }
     const ch = channels.find(c => c.id === current);
     if (!ch) {
         nowLogo.hidden = true;
@@ -282,7 +676,9 @@ function toast(text: string): void {
 
 function selectChannel(id: string, announce: boolean): void {
     if (!channels.some(c => c.id === id)) return;
-    const changed = id !== current;
+    syncSeq++;
+    const changed = id !== current || mode !== 'live';
+    if (mode !== 'live') leaveRecorded();
     current = id;
     store.set('channel', id);
     if (changed) {
@@ -300,14 +696,25 @@ function selectChannel(id: string, announce: boolean): void {
 function chooseInitialChannel(): void {
     if (initialChosen || channels.length === 0) return;
     initialChosen = true;
+    if (room?.rec) {
+        // みんなが録画を見ていればそれに合わせる。合わせられなければ、みんなの状態は変えずに自分だけ放送を見る
+        void applyRemoteRec(room.rec, null).then(result => {
+            if (result === 'failed') chooseLiveChannel(false);
+        });
+        return;
+    }
+    chooseLiveChannel(true);
+}
+
+/** 最初に見る放送中のチャンネルを決める。announce なら、まだ誰も選んでいないときに自分の選局をみんなの基準にする */
+function chooseLiveChannel(announce: boolean): void {
     if (room?.channel && channels.some(c => c.id === room!.channel)) {
         selectChannel(room.channel, false);
         return;
     }
     const stored = store.get('channel');
     const first = channels.find(c => c.id === stored) ?? channels[0];
-    // まだ誰も選んでいなければ、自分の選局をみんなの基準にする
-    selectChannel(first.id, true);
+    selectChannel(first.id, announce);
 }
 
 function onRoomState(next: RoomState): void {
@@ -318,7 +725,12 @@ function onRoomState(next: RoomState): void {
         chooseInitialChannel();
         return;
     }
-    if (!syncInput.checked || !next.channel || next.channel === current) return;
+    if (!syncInput.checked) return;
+    if (next.rec) {
+        void applyRemoteRec(next.rec, previous ? next.by : null);
+        return;
+    }
+    if (!next.channel || (next.channel === current && mode === 'live')) return;
     const name = channels.find(c => c.id === next.channel)?.name ?? next.channel;
     selectChannel(next.channel, false);
     if (previous && next.by) toast(`${next.by} さんが ${name} に切り替えました`);
@@ -360,7 +772,7 @@ function setupControls(qualities: string[]): void {
     qualitySelect.addEventListener('change', () => {
         quality = qualitySelect.value;
         store.set('quality', quality);
-        if (current) player.load(streamUrl(current));
+        if (mode === 'live' && current) player.load(streamUrl(current));
         restartData();
     });
 
@@ -390,7 +802,9 @@ function setupControls(qualities: string[]): void {
     syncInput.checked = store.get('sync') !== '0';
     syncInput.addEventListener('change', () => {
         store.set('sync', syncInput.checked ? '1' : '0');
-        if (syncInput.checked && room?.channel && room.channel !== current) selectChannel(room.channel, false);
+        if (!syncInput.checked || !room) return;
+        if (room.rec) void applyRemoteRec(room.rec, null);
+        else if (room.channel && (room.channel !== current || mode !== 'live')) selectChannel(room.channel, false);
     });
 
     toggleListBtn.addEventListener('click', () => {
@@ -479,6 +893,7 @@ async function boot(): Promise<void> {
         clientId: string;
         scopes: string[];
         dev: boolean;
+        recorded: boolean;
     };
 
     let code: string | undefined;
@@ -520,6 +935,7 @@ async function boot(): Promise<void> {
     setStatus('チャンネルを取得しています…');
     const qualities = await refreshChannels();
     setupControls(qualities);
+    if (config.recorded) setupRecorded();
     if (channels.length === 0) {
         setStatus('視聴できるチャンネルがありません', false);
         return;

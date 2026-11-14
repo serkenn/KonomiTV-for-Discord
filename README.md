@@ -3,29 +3,33 @@
 自宅の [KonomiTV](https://github.com/tsukumijima/KonomiTV) で受信しているテレビ放送を、Discord のアクティビティとしてボイスチャンネルの中で見るためのアプリです。
 
 - チャンネル一覧と放送中の番組を表示し、選んだチャンネルのライブ映像を再生します
-- 誰かがチャンネルを変えると、同じアクティビティにいる全員が同じチャンネルに切り替わります（各自でオフにできます）
-- 画質と音量は各自で変えられます
+- [EPGStation](https://github.com/l3tnun/EPGStation) の録画を一覧・検索して再生できます。保存済みの mp4 / webm はそのまま、TS はその場で mp4 / webm に変換して配信します
+- 誰かがチャンネルや録画を切り替えると、同じアクティビティにいる全員がそろいます。録画は再生・一時停止・シークもそろいます（各自でオフにできます）
+- 画質・配信形式・音量は各自で変えられます
 - データ放送（d ボタン）を表示して、画面上のリモコンやキーボードで操作できます
 - 見られるのは、許可した Discord サーバーのメンバーか、許可したユーザーだけです
 
-KonomiTV 本体には手を入れません。このアプリが KonomiTV の API とライブ映像を中継します。
+KonomiTV と EPGStation には手を入れません。このアプリが両方の API と映像を中継します。
 
 ## 仕組み
 
 ```
 Discord クライアント ─ Discord のプロキシ (<アプリID>.discordsays.com)
         └─ 公開ホスト名 (Cloudflare Tunnel など)
-              └─ このアプリ (127.0.0.1:7100) ─ KonomiTV (https://127-0-0-1.local.konomi.tv:7000)
+              └─ このアプリ (127.0.0.1:7100)
+                    ├─ KonomiTV (https://127-0-0-1.local.konomi.tv:7000)  放送中の番組・データ放送
+                    └─ EPGStation (http://127.0.0.1:8888)                  録画
 ```
 
 | 場所 | 中身 |
 |---|---|
-| `server/index.mjs` | 中継サーバー。Discord の認証、視聴許可の判定、KonomiTV の中継、チャンネル同期 (WebSocket) |
-| `client/` | 画面。Vite + TypeScript、再生は mpegts.js |
+| `server/index.mjs` | 中継サーバー。Discord の認証、視聴許可の判定、KonomiTV と EPGStation の中継、チャンネルと録画の同期 (WebSocket) |
+| `client/` | 画面。Vite + TypeScript、放送中の番組の再生は mpegts.js、データ放送は web-bml |
 
 ## 必要なもの
 
 - KonomiTV が動いているマシン（Docker が使えること）
+- 録画を見るなら EPGStation（同じマシンにあれば設定はいりません）
 - 外から HTTPS で届く公開ホスト名（Cloudflare Tunnel など）
 - Discord のアプリ（[Developer Portal](https://discord.com/developers/applications) で作る）
 
@@ -57,6 +61,7 @@ docker compose up -d --build
 | `ALLOWED_GUILD_IDS` | 視聴を許可する Discord サーバーの ID（カンマ区切り）。メンバー全員が見られる |
 | `ALLOWED_USER_IDS` | 個別に許可するユーザーの ID（カンマ区切り） |
 | `KONOMITV_URL` | KonomiTV の URL。同じマシンなら既定値のままでよい |
+| `EPGSTATION_URL` | EPGStation の URL。既定値は `http://127.0.0.1:8888`。空にすると録画タブを出さない |
 
 `ALLOWED_GUILD_IDS` と `ALLOWED_USER_IDS` が両方空のときは、全員を拒否します。ID は Discord の「開発者モード」をオンにして、サーバーやユーザーを右クリック →「ID をコピー」で取れます。
 
@@ -68,15 +73,18 @@ docker compose up -d --build
 
 ### 4. Discord で開く
 
-ボイスチャンネルに入り、アクティビティ（ロケットのアイコン）から作ったアプリを選びます。公開審査を通していないアプリは、アプリの持ち主と Developer Portal のチームメンバーだけが起動できます。
+ボイスチャンネルに入り、アクティビティ（ロケットのアイコン）から作ったアプリを選びます。Discord の審査を通していないアプリは、メンバー 25 人未満のサーバーか DM でしか起動できません。
 
 ## 知っておくこと
 
 - **画質ごとにエンコードが 1 本走ります**。同じチャンネル・同じ画質の視聴者は 1 本を共有するので、みんなで 720p のままにしておくのが軽いです
-- 再生には Media Source Extensions が必要です。PC 版 Discord とブラウザ版で動きます。モバイル版は端末によって再生できないことがあります
+- 放送中の番組の再生には Media Source Extensions が必要です。PC 版 Discord とブラウザ版で動きます。モバイル版は端末によって再生できないことがあります
+- 録画は、EPGStation でエンコード済みの mp4 / webm があればそれをそのまま配信するので、シークがすぐ効きます。TS しかない録画は EPGStation がその場で mp4 / webm に変換するので、シークのたびに変換し直します（選べる画質は EPGStation の `stream.recorded` の設定に従います）
+- 録画の配信形式（mp4 / webm、保存済み / 変換）は各自で選べます。みんなでそろうのは、どの録画の何秒目を見ているかと、再生中か一時停止中かです
+- 録画の一覧（番組名やサムネイル）は、視聴を許可した人全員に見えます
 - データ放送は操作バーの「d」でリモコンを開くと読み込みます。操作は各自の画面だけに反映され、他の人とは同期しません。キーボードでは矢印・Enter・Backspace（戻る）・D・B/R/G/Y（色ボタン）・数字が使えます
 - データ放送のうち、通信を使う機能（投票など）と郵便番号に依存する表示（地域の天気など）は動きません
-- 録画番組の再生、実況コメント、字幕にはまだ対応していません
+- 実況コメントと字幕にはまだ対応していません
 - テレビ放送を不特定の人に見せると著作権（公衆送信権）の問題になります。視聴を許可する範囲は自分と身内にとどめてください
 
 ## 開発
