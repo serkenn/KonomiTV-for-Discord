@@ -16,6 +16,10 @@ export class LivePlayer {
 
     /** 自動再生がブロックされ、ミュートして再生を始めたときに呼ばれる */
     onAutoplayMuted: () => void = () => {};
+    /** 新しいストリームを読み込み始めたとき (映像の時刻の基準が変わる) */
+    onStreamStart: () => void = () => {};
+    /** 字幕・文字スーパーのデータ (ID3) が届いたとき。pts は映像の時刻 (秒) */
+    onTimedID3: (pts: number, data: Uint8Array) => void = () => {};
 
     constructor(
         private readonly video: HTMLVideoElement,
@@ -44,6 +48,13 @@ export class LivePlayer {
                 this.scheduleRetry(0);
             }
         }, 3000);
+    }
+
+    /** 受け取ってまだ映していない分の長さ (秒)。実況コメントをこの分だけ遅らせて映像に合わせる */
+    get latency(): number {
+        const buffered = this.video.buffered;
+        if (buffered.length === 0) return 0;
+        return Math.max(0, buffered.end(buffered.length - 1) - this.video.currentTime);
     }
 
     static get supported(): boolean {
@@ -87,6 +98,10 @@ export class LivePlayer {
         );
         this.player = player;
         player.attachMediaElement(this.video);
+        this.onStreamStart();
+        player.on(mpegts.Events.TIMED_ID3_METADATA_ARRIVED, (meta: { pts?: number; data?: Uint8Array }) => {
+            if (this.player === player && meta.pts !== undefined && meta.data) this.onTimedID3(meta.pts / 1000, meta.data);
+        });
         player.on(mpegts.Events.ERROR, () => {
             if (this.player === player) this.scheduleRetry();
         });

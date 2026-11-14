@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@discord/embedded-app-sdk": "^2.5.0",
+    "aribb24.js": "~1.11.5",
     "mpegts.js": "^1.8.2",
     "web-bml": "^1.0.1"
   },

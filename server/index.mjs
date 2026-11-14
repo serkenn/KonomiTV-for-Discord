@@ -1,6 +1,6 @@
 // KonomiTV for Discord — 中継サーバー
-// 役割: Discord の OAuth コード交換 / 視聴許可の判定 / KonomiTV のライブ映像とデータ放送の中継 /
-//       EPGStation の録画の中継 / チャンネルと録画の同期 (WebSocket)
+// 役割: Discord の OAuth コード交換 / 視聴許可の判定 / KonomiTV のライブ映像とデータ放送の中継 (副音声・主+副の切り替え) /
+//       EPGStation の録画の中継 / 実況コメントの中継 / チャンネルと録画の同期 (WebSocket)
 import { createServer } from 'node:http';
 import { randomBytes } from 'node:crypto';
 import { createReadStream } from 'node:fs';
@@ -9,6 +9,8 @@ import { Readable } from 'node:stream';
 import { dirname, extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
+import { canMixAudio, spawnAudioMixer, swapAudioPids } from './audio.mjs';
+import { createJikkyoHub } from './jikkyo.mjs';
 
 const env = process.env;
 const PORT = Number(env.PORT || 7100);
@@ -29,6 +31,8 @@ if (DEV_NO_AUTH && HOST !== '127.0.0.1') {
 }
 
 const QUALITIES = ['1080p', '720p', '540p', '480p', '360p', '240p'];
+// 主音声 / 副音声 / 主+副 (左に主音声、右に副音声)
+const AUDIO_MODES = ['main', 'sub', 'both'];
 const CHANNEL_ID_RE = /^[a-z0-9]{2,8}(-[0-9]{1,2})?$/;
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 // 映像 (録画の変換配信を含む) とデータ放送で 1 人 2 本。切り替え中は一時的に倍になる
@@ -44,6 +48,7 @@ const sessions = new Map();
 const rooms = new Map();
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
+const jikkyo = createJikkyoHub({ konomitvUrl: KONOMITV_URL, log });
 
 function sendJson(res, status, body) {
     const data = JSON.stringify(body);
@@ -168,7 +173,17 @@ async function handleToken(req, res) {
 let channelsCache = { at: 0, data: null };
 
 const pickProgram = p =>
-    p ? { title: p.title, description: p.description, start_time: p.start_time, end_time: p.end_time } : null;
+    p
+        ? {
+              title: p.title,
+              description: p.description,
+              start_time: p.start_time,
+              end_time: p.end_time,
+              // 副音声があるかどうかの判断に使う (主音声がデュアルモノなら、右チャンネルが副音声になる)
+              primary_audio_type: p.primary_audio_type ?? null,
+              secondary_audio_type: p.secondary_audio_type ?? null,
+          }
+        : null;
 
 async function handleChannels(res) {
     if (!channelsCache.data || Date.now() - channelsCache.at > 5000) {
@@ -212,11 +227,34 @@ async function handleLogo(res, id) {
     res.end(buf);
 }
 
+/** 主+副: ffmpeg で音声だけ作り直して流す */
+function pipeThroughMixer(body, res) {
+    const ff = spawnAudioMixer();
+    let stderr = '';
+    ff.stderr.on('data', d => (stderr = (stderr + d).slice(-400)));
+    // ffmpeg が先に終わったときに書き込めなくなるのは気にしない
+    ff.stdin.on('error', () => {});
+    ff.on('error', e => {
+        log('ffmpeg error', e.message);
+        res.destroy();
+    });
+    ff.on('close', (code, signal) => {
+        if (code !== 0 && !res.destroyed) {
+            log('ffmpeg exited', code ?? signal, stderr.trim());
+            res.destroy();
+        }
+    });
+    res.on('close', () => ff.kill('SIGKILL'));
+    body.pipe(ff.stdin);
+    ff.stdout.pipe(res);
+}
+
 /**
  * KonomiTV の終わりのないレスポンスをそのまま流す。
  * kind: 'mpegts' は映像、'psi-archived-data' はデータ放送 (d ボタン) の元データ。
+ * audio: 映像の音声。'sub' は副音声、'both' は主+副。
  */
-async function handleStream(req, res, session, id, quality, kind = 'mpegts') {
+async function handleStream(req, res, session, id, quality, kind = 'mpegts', audio = 'main') {
     if (session.streams >= MAX_STREAMS_PER_SESSION) return sendJson(res, 429, { error: 'too_many_streams' });
     session.streams++;
     const ac = new AbortController();
@@ -235,7 +273,7 @@ async function handleStream(req, res, session, id, quality, kind = 'mpegts') {
             return sendJson(res, 502, { error: 'konomitv_error', status: up.status });
         }
         const isVideo = kind === 'mpegts';
-        log(isVideo ? 'stream start' : 'data start', session.user.name, id, quality);
+        log(isVideo ? 'stream start' : 'data start', session.user.name, id, quality, ...(audio === 'main' ? [] : [`audio=${audio}`]));
         res.writeHead(200, {
             'Content-Type': isVideo ? 'video/mp2t' : 'application/octet-stream',
             'Cache-Control': 'no-store, no-transform',
@@ -244,7 +282,9 @@ async function handleStream(req, res, session, id, quality, kind = 'mpegts') {
         const body = Readable.fromWeb(up.body);
         body.on('error', () => res.destroy());
         if (isVideo) body.on('end', () => log('stream end', session.user.name, id, quality));
-        body.pipe(res);
+        if (audio === 'sub') body.pipe(swapAudioPids()).on('error', () => res.destroy()).pipe(res);
+        else if (audio === 'both') pipeThroughMixer(body, res);
+        else body.pipe(res);
     } catch (e) {
         release();
         if (!res.headersSent) sendJson(res, 502, { error: 'konomitv_unreachable' });
@@ -338,6 +378,68 @@ async function handleRecordedDuration(res, id) {
     if (!(await knownRecFile(id))) return sendJson(res, 404, { error: 'not_found' });
     const d = await epgJson(`/api/videos/${id}/duration`);
     sendJson(res, 200, { duration: Number(d.duration) || 0 });
+}
+
+// ---------- 録画の実況コメント (過去ログ) ----------
+// KonomiTV が同じ TS を読み込んでいれば、録画の開始時刻に合わせた過去ログを返してくれる
+
+async function konomiJson(path, timeout = 10000) {
+    const r = await fetch(`${KONOMITV_URL}${path}`, { signal: AbortSignal.timeout(timeout) });
+    if (!r.ok) throw Object.assign(new Error(`KonomiTV ${path} -> ${r.status}`), { status: r.status });
+    return r.json();
+}
+
+/** KonomiTV の録画 (ファイル名 -> 番号) */
+let konomiVideos = { at: 0, ids: new Map() };
+/** 録画番号 -> 過去ログ (同じ録画を何人かで見るときに取り直さない) */
+const recCommentCache = new Map();
+
+async function findKonomiVideo(filename) {
+    const age = Date.now() - konomiVideos.at;
+    // 5 分ごとに取り直す。見つからないときは、新しく録画されたかもしれないので 30 秒たっていれば取り直す
+    if (age > 5 * 60 * 1000 || (!konomiVideos.ids.has(filename) && age > 30 * 1000)) {
+        const ids = new Map();
+        for (let page = 1; page <= 100; page++) {
+            const d = await konomiJson(`/api/videos?order=desc&page=${page}`);
+            const list = d.recorded_programs ?? [];
+            for (const v of list) {
+                const file = v.recorded_video?.file_path;
+                if (typeof file === 'string') ids.set(file.slice(file.lastIndexOf('/') + 1), v.id);
+            }
+            if (list.length === 0 || ids.size >= d.total) break;
+        }
+        konomiVideos = { at: Date.now(), ids };
+    }
+    return konomiVideos.ids.get(filename) ?? null;
+}
+
+async function handleRecordedComments(res, recordedId) {
+    let record;
+    try {
+        record = await epgJson(`/api/recorded/${recordedId}?isHalfWidth=true`);
+    } catch (e) {
+        if (e.status === 404) return sendJson(res, 404, { error: 'not_found' });
+        throw e;
+    }
+    const ts = (record.videoFiles ?? []).find(v => v.type === 'ts');
+    if (!ts) return sendJson(res, 200, { comments: [], detail: 'TS ファイルが残っていない録画には、コメントを出せません' });
+    const videoId = await findKonomiVideo(ts.filename);
+    if (videoId === null) {
+        return sendJson(res, 200, { comments: [], detail: 'KonomiTV がまだこの録画を読み込んでいないため、コメントを出せません' });
+    }
+    const cached = recCommentCache.get(videoId);
+    if (cached && Date.now() - cached.at < 10 * 60 * 1000) return sendJson(res, 200, cached.body);
+
+    const d = await konomiJson(`/api/videos/${videoId}/jikkyo`, 60 * 1000);
+    if (!d.is_success) return sendJson(res, 200, { comments: [], detail: d.detail || 'コメントを取得できませんでした' });
+    // [録画の先頭からの秒数, 本文, 流し方, 大きさ, 色]。投稿者の ID は送らない
+    const comments = (d.comments ?? [])
+        .filter(c => typeof c.text === 'string' && c.text !== '' && c.text.length <= 200 && Number.isFinite(c.time))
+        .map(c => [Math.round(c.time * 100) / 100, c.text, c.type, c.size, c.color]);
+    const body = { comments, detail: null };
+    recCommentCache.set(videoId, { at: Date.now(), body });
+    if (recCommentCache.size > 20) recCommentCache.delete(recCommentCache.keys().next().value);
+    sendJson(res, 200, body);
 }
 
 async function handleRecordedThumbnail(res, id) {
@@ -485,6 +587,7 @@ const server = createServer(async (req, res) => {
                 scopes: ['identify', ...(ALLOWED_GUILDS.size > 0 ? ['guilds'] : [])],
                 dev: DEV_NO_AUTH,
                 recorded: EPGSTATION_URL !== '',
+                audioMix: canMixAudio,
             });
         }
         if (path === '/api/token' && req.method === 'POST') return await handleToken(req, res);
@@ -498,7 +601,11 @@ const server = createServer(async (req, res) => {
         if (m && CHANNEL_ID_RE.test(m[1])) return await handleLogo(res, m[1]);
         m = path.match(/^\/api\/stream\/([^/]+)\/([^/]+)$/);
         if (m && CHANNEL_ID_RE.test(m[1]) && QUALITIES.includes(m[2])) {
-            return await handleStream(req, res, session, m[1], m[2]);
+            const audio = url.searchParams.get('audio') ?? 'main';
+            if (!AUDIO_MODES.includes(audio) || (audio === 'both' && !canMixAudio)) {
+                return sendJson(res, 400, { error: 'bad_audio' });
+            }
+            return await handleStream(req, res, session, m[1], m[2], 'mpegts', audio);
         }
         m = path.match(/^\/api\/psi\/([^/]+)\/([^/]+)$/);
         if (m && CHANNEL_ID_RE.test(m[1]) && QUALITIES.includes(m[2])) {
@@ -512,6 +619,8 @@ const server = createServer(async (req, res) => {
             if (m) return await handleRecordedItem(res, Number(m[1]));
             m = path.match(/^\/api\/recorded\/duration\/(\d{1,9})$/);
             if (m) return await handleRecordedDuration(res, Number(m[1]));
+            m = path.match(/^\/api\/recorded\/comments\/(\d{1,9})$/);
+            if (m) return await handleRecordedComments(res, Number(m[1]));
             m = path.match(/^\/api\/recorded\/file\/(\d{1,9})$/);
             if (m) return await handleRecordedFile(req, res, Number(m[1]));
             m = path.match(/^\/api\/recorded\/stream\/(\d{1,9})\/(mp4|webm)\/([0-9])$/);
@@ -593,9 +702,16 @@ server.on('upgrade', (req, socket, head) => {
                 room.rec = { recordedId: msg.recordedId, pos: msg.pos, playing: msg.playing !== false, at: Date.now() };
                 room.by = session.user.name;
                 broadcast(room);
+            } else if (
+                msg?.type === 'comments' &&
+                (msg.channel === null || (typeof msg.channel === 'string' && CHANNEL_ID_RE.test(msg.channel)))
+            ) {
+                // 実況コメントは各自が見ているチャンネルの分だけ受け取る (同期をオフにしている人もいるため)
+                jikkyo.subscribe(ws, msg.channel);
             }
         });
         ws.on('close', () => {
+            jikkyo.unsubscribe(ws);
             room.clients.delete(ws);
             if (room.clients.size === 0) rooms.delete(instance);
             else broadcast(room);

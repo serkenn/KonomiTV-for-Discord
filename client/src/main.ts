@@ -1,4 +1,6 @@
 import { DiscordSDK } from '@discord/embedded-app-sdk';
+import { Captions } from './captions';
+import { CommentLayer, makeComment, type CommentItem } from './comments';
 import { DataBroadcast, Key, type DataStatus } from './databroadcast';
 import { LivePlayer, type PlayerState } from './player';
 import { RecordedPlayer, type RecSource } from './recorded';
@@ -9,6 +11,8 @@ interface Program {
     description: string;
     start_time: string;
     end_time: string;
+    primary_audio_type: string | null;
+    secondary_audio_type: string | null;
 }
 interface Channel {
     id: string;
@@ -104,6 +108,11 @@ const tabRec = $<HTMLButtonElement>('tab-rec');
 const recordedBox = $('recorded-box');
 const recordedList = $('recorded');
 const recSearch = $<HTMLInputElement>('rec-search');
+const captionLayer = $('captions');
+const commentLayer = $('comments');
+const captionBtn = $<HTMLButtonElement>('toggle-captions');
+const commentBtn = $<HTMLButtonElement>('toggle-comments');
+const audioSelect = $<HTMLSelectElement>('audio');
 
 const store = {
     get(key: string): string | null {
@@ -145,6 +154,18 @@ let currentRec: { record: RecordItem; value: string } | null = null;
 let seeking = false;
 /** 選局・録画の切り替えの通し番号。遅れて終わった古い同期の指示を捨てるのに使う */
 let syncSeq = 0;
+type AudioMode = 'main' | 'sub' | 'both';
+/** 音声 (主音声 / 副音声 / 主+副)。副音声は番組ごとのものなので、チャンネルを変えたら主音声に戻す */
+let audioMode: AudioMode = 'main';
+let captionsOn = store.get('captions') === '1';
+let commentsOn = store.get('comments') !== '0';
+/** サーバーに頼んでいる実況コメントのチャンネル */
+let commentChannel: string | null = null;
+/** 実況が使えないと知らせ済みのチャンネル (同じお知らせを何度も出さない) */
+let commentNoticeChannel: string | null = null;
+/** 録画の過去ログの 1 件: [録画の先頭からの秒数, 本文, 流し方, 大きさ, 色] */
+type RecComment = [number, string, string, string, string];
+let recComments: { recordedId: number; list: RecComment[]; next: number; last: number } | null = null;
 
 function setStatus(text: string | null, busy = true): void {
     statusBox.hidden = text === null;
@@ -175,7 +196,8 @@ async function api<T>(path: string): Promise<T> {
 const logoUrl = (id: string) => `${BASE}/api/channels/${id}/logo?t=${encodeURIComponent(session)}`;
 // mpegts.js は Worker の中から取得するので、絶対 URL で渡す
 const streamUrl = (id: string) =>
-    `${location.origin}${BASE}/api/stream/${id}/${quality}?t=${encodeURIComponent(session)}`;
+    `${location.origin}${BASE}/api/stream/${id}/${quality}?t=${encodeURIComponent(session)}` +
+    (audioMode === 'main' ? '' : `&audio=${audioMode}`);
 
 const dataUrl = (id: string) =>
     `${location.origin}${BASE}/api/psi/${id}/${quality}?t=${encodeURIComponent(session)}`;
@@ -196,6 +218,174 @@ data.onStatus = status => {
     remoteBox.classList.toggle('is-disabled', status !== 'ready');
 };
 data.onError = text => toast(text);
+data.onVisibleChange = visible => stage.classList.toggle('is-bml', visible);
+
+// ---------- 字幕 ----------
+
+const captions = new Captions(video, captionLayer, new URL('./fonts/KosugiMaru-Regular.woff2', document.baseURI).href);
+captions.setVisible(captionsOn);
+player.onStreamStart = () => captions.reset();
+player.onTimedID3 = (pts, data) => captions.push(pts, data);
+
+// ---------- 音声 ----------
+
+/** いまの番組に副音声があるか (主音声がデュアルモノなら、右チャンネルが副音声になる) */
+function hasSecondaryAudio(): boolean {
+    const p = channels.find(c => c.id === current)?.present;
+    return !!p && (!!p.secondary_audio_type || /デュアルモノ/.test(p.primary_audio_type ?? ''));
+}
+
+function renderAudio(): void {
+    const available = hasSecondaryAudio();
+    for (const option of audioSelect.options) {
+        if (option.value !== 'main') option.disabled = !available;
+    }
+    audioSelect.value = audioMode;
+    audioSelect.title = available ? '音声の切り替え' : 'この番組には副音声がありません';
+}
+
+function setAudioMode(next: AudioMode): void {
+    if (next === audioMode) return;
+    audioMode = next;
+    renderAudio();
+    // 音声はサーバーで選ぶので、映像をつなぎ直す
+    if (mode === 'live' && current) player.load(streamUrl(current));
+}
+
+// ---------- 実況コメント ----------
+
+const danmaku = new CommentLayer(commentLayer);
+video.addEventListener('pause', () => danmaku.setPaused(true));
+video.addEventListener('play', () => danmaku.setPaused(false));
+
+/** コメントを流す範囲を、映像が映っている部分 (上下や左右の黒帯を除いた部分) に合わせる */
+function fitCommentLayer(): void {
+    const width = stage.clientWidth;
+    const height = stage.clientHeight;
+    const aspect = video.videoWidth > 0 && video.videoHeight > 0 ? video.videoWidth / video.videoHeight : 16 / 9;
+    let w = width;
+    let h = width / aspect;
+    if (h > height) {
+        h = height;
+        w = height * aspect;
+    }
+    Object.assign(commentLayer.style, {
+        left: `${(width - w) / 2}px`,
+        top: `${(height - h) / 2}px`,
+        width: `${w}px`,
+        height: `${h}px`,
+    });
+}
+new ResizeObserver(fitCommentLayer).observe(stage);
+video.addEventListener('loadedmetadata', fitCommentLayer);
+video.addEventListener('resize', fitCommentLayer);
+
+/** 実況コメントを受け取るチャンネルをサーバーに伝える (放送中の番組を見ていて、コメントを出すときだけ受け取る) */
+function syncCommentSubscription(force = false): void {
+    const want = commentsOn && mode === 'live' ? current : null;
+    if (!force && want === commentChannel) return;
+    if (want !== commentChannel) danmaku.clear();
+    commentChannel = want;
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'comments', channel: want }));
+}
+
+function onLiveComments(channel: string, rows: unknown): void {
+    if (!Array.isArray(rows) || channel !== commentChannel) return;
+    const items = rows
+        .map(r => (Array.isArray(r) ? makeComment(r[0], r[1], r[2], r[3]) : null))
+        .filter((c): c is CommentItem => c !== null);
+    // 映像は受け取ってからバッファの分だけ遅れて映るので、その分待ってから流す。
+    // サーバーは 0.25 秒ごとにまとめて送ってくるので、一斉に並ばないよう、その間に散らして流す
+    const delay = player.latency * 1000;
+    const spacing = items.length > 1 ? 250 / items.length : 0;
+    items.forEach((c, i) => {
+        window.setTimeout(() => {
+            if (channel === commentChannel) danmaku.add(c);
+        }, delay + i * spacing);
+    });
+}
+
+async function loadRecComments(record: RecordItem): Promise<void> {
+    if (recComments?.recordedId === record.id) {
+        // 同じ録画の配信形式を変えただけ。位置が変わったかもしれないので、次の見回りで合わせ直す
+        recComments.next = -1;
+        return;
+    }
+    recComments = null;
+    if (!commentsOn) return;
+    try {
+        const result = await api<{ comments: RecComment[]; detail: string | null }>(`/api/recorded/comments/${record.id}`);
+        if (currentRec?.record.id !== record.id || !commentsOn || mode !== 'rec') return;
+        if (result.comments.length === 0) {
+            toast(result.detail ?? 'この録画には実況コメントがありません');
+            return;
+        }
+        recComments = { recordedId: record.id, list: result.comments.sort((a, b) => a[0] - b[0]), next: -1, last: 0 };
+    } catch {
+        toast('実況コメントを取得できませんでした');
+    }
+}
+
+/** 録画の再生位置に合わせて過去ログを流す */
+function tickRecComments(): void {
+    const rc = recComments;
+    if (!rc || mode !== 'rec' || !commentsOn || currentRec?.record.id !== rc.recordedId) return;
+    const pos = recPlayer.position;
+    // 見始めたときとシークしたときは、今の位置から流し直す
+    if (rc.next < 0 || pos < rc.last || pos - rc.last > 2) {
+        if (rc.next >= 0) danmaku.clear();
+        let lo = 0;
+        let hi = rc.list.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (rc.list[mid][0] < pos) lo = mid + 1;
+            else hi = mid;
+        }
+        rc.next = lo;
+        rc.last = pos;
+        return;
+    }
+    while (rc.next < rc.list.length && rc.list[rc.next][0] <= pos) {
+        const [, text, type, size, color] = rc.list[rc.next++];
+        const item = makeComment(text, type, size, color);
+        if (item) danmaku.add(item);
+    }
+    rc.last = pos;
+}
+window.setInterval(tickRecComments, 100);
+
+function renderToggles(): void {
+    captionBtn.classList.toggle('is-on', captionsOn);
+    captionBtn.setAttribute('aria-pressed', String(captionsOn));
+    commentBtn.classList.toggle('is-on', commentsOn);
+    commentBtn.setAttribute('aria-pressed', String(commentsOn));
+}
+
+function setupAv(audioMix: boolean): void {
+    // 主+副 はサーバーに ffmpeg があるときだけ選べる
+    if (!audioMix) audioSelect.querySelector('option[value="both"]')?.remove();
+    audioSelect.addEventListener('change', () => setAudioMode(audioSelect.value as AudioMode));
+    captionBtn.addEventListener('click', () => {
+        captionsOn = !captionsOn;
+        store.set('captions', captionsOn ? '1' : '0');
+        captions.setVisible(captionsOn);
+        renderToggles();
+    });
+    commentBtn.addEventListener('click', () => {
+        commentsOn = !commentsOn;
+        store.set('comments', commentsOn ? '1' : '0');
+        danmaku.clear();
+        commentNoticeChannel = null;
+        syncCommentSubscription();
+        if (mode === 'rec' && currentRec) {
+            recComments = null;
+            if (commentsOn) void loadRecComments(currentRec.record);
+        }
+        renderToggles();
+    });
+    renderToggles();
+    renderAudio();
+}
 
 /** いまのチャンネルと画質でデータ放送を始め直す (リモコンを閉じているときは止める) */
 function restartData(): void {
@@ -380,7 +570,8 @@ function renderRecorded(): void {
 function renderMode(): void {
     const rec = mode === 'rec';
     playBtn.hidden = seekInput.hidden = timeLabel.hidden = sourceSelect.hidden = !rec;
-    qualitySelect.hidden = toggleRemoteBtn.hidden = rec;
+    // 字幕・音声の切り替え・データ放送は放送中の番組だけ
+    qualitySelect.hidden = toggleRemoteBtn.hidden = audioSelect.hidden = captionBtn.hidden = rec;
     renderRemote();
     if (!rec || !currentRec) return;
     const selected = currentRec.value;
@@ -417,6 +608,9 @@ function playRecorded(record: RecordItem, value: string, position: number, playi
     data.stop();
     current = null;
     currentRec = { record, value };
+    captions.detach();
+    syncCommentSubscription();
+    void loadRecComments(record);
     setStatus(`${record.name} を読み込んでいます…`);
     recPlayer.load(recSource(value), (record.end - record.start) / 1000, position);
     if (playing) playVideo();
@@ -443,6 +637,7 @@ function playRecorded(record: RecordItem, value: string, position: number, playi
 function leaveRecorded(): void {
     recPlayer.stop();
     currentRec = null;
+    recComments = null;
     mode = 'live';
     renderMode();
     renderRecorded();
@@ -677,16 +872,20 @@ function toast(text: string): void {
 function selectChannel(id: string, announce: boolean): void {
     if (!channels.some(c => c.id === id)) return;
     syncSeq++;
-    const changed = id !== current || mode !== 'live';
+    const channelChanged = id !== current;
+    const changed = channelChanged || mode !== 'live';
     if (mode !== 'live') leaveRecorded();
     current = id;
     store.set('channel', id);
     if (changed) {
+        if (channelChanged) audioMode = 'main';
         player.load(streamUrl(id));
         restartData();
     }
     renderChannels();
     renderNow();
+    renderAudio();
+    syncCommentSubscription();
     if (announce && syncInput.checked && ws?.readyState === WebSocket.OPEN && room?.channel !== id) {
         ws.send(JSON.stringify({ type: 'select', channel: id }));
     }
@@ -742,12 +941,23 @@ function connectRoom(instance: string): void {
         `${proto}://${location.host}${BASE}/api/ws?instance=${encodeURIComponent(instance)}&t=${encodeURIComponent(session)}`,
     );
     ws = socket;
+    // つなぎ直したときは、実況コメントの受け取りも頼み直す
+    socket.addEventListener('open', () => syncCommentSubscription(true));
     socket.addEventListener('message', e => {
+        let msg: { type?: unknown; channel?: unknown; comments?: unknown; ok?: unknown; detail?: unknown };
         try {
-            const msg = JSON.parse(String(e.data)) as RoomState;
-            if (msg.type === 'state') onRoomState(msg);
+            msg = JSON.parse(String(e.data));
         } catch {
-            // 壊れたメッセージは無視する
+            return; // 壊れたメッセージは無視する
+        }
+        if (msg.type === 'state') {
+            onRoomState(msg as unknown as RoomState);
+        } else if (msg.type === 'chat' && typeof msg.channel === 'string') {
+            onLiveComments(msg.channel, msg.comments);
+        } else if (msg.type === 'comments-status' && msg.ok === false && msg.channel === commentChannel) {
+            if (commentNoticeChannel === commentChannel) return;
+            commentNoticeChannel = commentChannel;
+            toast(typeof msg.detail === 'string' ? msg.detail : '実況コメントを受け取れませんでした');
         }
     });
     socket.addEventListener('close', () => {
@@ -883,6 +1093,12 @@ async function refreshChannels(): Promise<string[]> {
     channels = data.channels;
     renderChannels();
     renderNow();
+    // 副音声で見ていて、副音声のない番組に変わったら主音声に戻す (副音声は無音になるため)
+    if (audioMode !== 'main' && mode === 'live' && !hasSecondaryAudio()) {
+        setAudioMode('main');
+        toast('副音声のない番組になったので、主音声に戻しました');
+    }
+    renderAudio();
     return data.qualities;
 }
 
@@ -894,6 +1110,7 @@ async function boot(): Promise<void> {
         scopes: string[];
         dev: boolean;
         recorded: boolean;
+        audioMix: boolean;
     };
 
     let code: string | undefined;
@@ -936,6 +1153,7 @@ async function boot(): Promise<void> {
     const qualities = await refreshChannels();
     setupControls(qualities);
     if (config.recorded) setupRecorded();
+    setupAv(config.audioMix);
     if (channels.length === 0) {
         setStatus('視聴できるチャンネルがありません', false);
         return;

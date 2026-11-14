@@ -36,6 +36,8 @@ export class DataBroadcast {
 
     onStatus: (status: DataStatus) => void = () => {};
     onError: (text: string) => void = () => {};
+    /** データ放送の画面を出したとき (true) と消したとき (false) */
+    onVisibleChange: (visible: boolean) => void = () => {};
 
     constructor(
         private readonly stage: HTMLElement,
@@ -85,6 +87,7 @@ export class DataBroadcast {
             container.hidden = false;
             this.rescale();
             this.moveVideoIn();
+            this.onVisibleChange(true);
             this.onStatus('ready');
         });
         browser.addEventListener('invisible', event => {
@@ -92,9 +95,11 @@ export class DataBroadcast {
             if (event.detail) {
                 this.moveVideoOut();
                 container.hidden = true;
+                this.onVisibleChange(false);
             } else {
                 container.hidden = false;
                 this.moveVideoIn();
+                this.onVisibleChange(true);
             }
         });
 
@@ -140,6 +145,7 @@ export class DataBroadcast {
         }
         this.container?.remove();
         this.container = null;
+        this.onVisibleChange(false);
         this.onStatus('off');
     }
 
