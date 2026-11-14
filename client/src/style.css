@@ -375,6 +375,120 @@ video {
     background: var(--accent);
 }
 
+/* ---------- データ放送 ---------- */
+
+.bml {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 960px;
+    height: 540px;
+    transform-origin: center;
+    background: #000;
+    overflow: hidden;
+}
+
+.icon-btn--d {
+    font-weight: 800;
+    font-size: 17px;
+    border: 1.5px solid rgb(255 255 255 / 0.5);
+}
+
+.icon-btn--d.is-on {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+}
+
+.remote {
+    flex: none;
+    display: grid;
+    gap: 8px;
+    padding: 12px;
+    border-top: 1px solid var(--line);
+    background: #101217;
+}
+
+.remote__status {
+    min-height: 1.4em;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.remote__row {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: 1fr;
+    gap: 6px;
+}
+
+.remote__pad {
+    display: grid;
+    grid-template-areas: '. up .' 'left enter right' '. down .';
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    width: 70%;
+    margin: 0 auto;
+}
+
+.remote__digits {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 6px;
+}
+
+.rk {
+    min-height: 34px;
+    padding: 0 6px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--panel-hover);
+    color: var(--text);
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.rk:hover {
+    filter: brightness(1.25);
+}
+
+.rk:active {
+    transform: translateY(1px);
+}
+
+.rk--d,
+.rk--enter {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+}
+
+.rk--blue {
+    background: #2456c9;
+    border-color: #2456c9;
+}
+
+.rk--red {
+    background: #c9302c;
+    border-color: #c9302c;
+}
+
+.rk--green {
+    background: #23893f;
+    border-color: #23893f;
+}
+
+.rk--yellow {
+    background: #d6b214;
+    border-color: #d6b214;
+    color: #1a1a1a;
+}
+
+.remote.is-disabled .rk {
+    opacity: 0.45;
+}
+
 /* ---------- 狭い画面 (モバイルやピクチャーインピクチャー) ---------- */
 
 @media (max-width: 760px) {

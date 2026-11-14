@@ -1,4 +1,5 @@
 import { DiscordSDK } from '@discord/embedded-app-sdk';
+import { DataBroadcast, Key, type DataStatus } from './databroadcast';
 import { LivePlayer, type PlayerState } from './player';
 import './style.css';
 
@@ -13,6 +14,7 @@ interface Channel {
     type: string;
     name: string;
     number: string;
+    service_id: number;
     is_radio: boolean;
     viewers: number;
     present: Program | null;
@@ -55,6 +57,10 @@ const qualitySelect = $<HTMLSelectElement>('quality');
 const toggleListBtn = $<HTMLButtonElement>('toggle-list');
 const sidebar = $('sidebar');
 const channelList = $('channels');
+const toggleRemoteBtn = $<HTMLButtonElement>('toggle-remote');
+const remoteBox = $('remote');
+const remoteStatus = $('remote-status');
+const remoteDigits = $('remote-digits');
 
 const store = {
     get(key: string): string | null {
@@ -80,6 +86,7 @@ let quality = store.get('quality') ?? '720p';
 let room: RoomState | null = null;
 let ws: WebSocket | null = null;
 let initialChosen = false;
+let remoteOn = store.get('remote') === '1';
 
 function setStatus(text: string | null, busy = true): void {
     statusBox.hidden = text === null;
@@ -111,6 +118,39 @@ const logoUrl = (id: string) => `${BASE}/api/channels/${id}/logo?t=${encodeURICo
 // mpegts.js は Worker の中から取得するので、絶対 URL で渡す
 const streamUrl = (id: string) =>
     `${location.origin}${BASE}/api/stream/${id}/${quality}?t=${encodeURIComponent(session)}`;
+
+const dataUrl = (id: string) =>
+    `${location.origin}${BASE}/api/psi/${id}/${quality}?t=${encodeURIComponent(session)}`;
+
+// ---------- データ放送 (d ボタン) ----------
+
+const DATA_STATUS_TEXT: Record<DataStatus, string> = {
+    off: '',
+    loading: 'データ放送を読み込んでいます…',
+    ready: 'd ボタンでデータ放送を表示できます',
+    unavailable: 'このチャンネルにはデータ放送がありません',
+    error: 'データ放送を取得できませんでした',
+};
+
+const data = new DataBroadcast(stage, video, new URL('./fonts/', document.baseURI).href);
+data.onStatus = status => {
+    remoteStatus.textContent = DATA_STATUS_TEXT[status];
+    remoteBox.classList.toggle('is-disabled', status !== 'ready');
+};
+data.onError = text => toast(text);
+
+/** いまのチャンネルと画質でデータ放送を始め直す (リモコンを閉じているときは止める) */
+function restartData(): void {
+    const ch = channels.find(c => c.id === current);
+    if (remoteOn && ch) data.start(dataUrl(ch.id), ch.service_id);
+    else data.stop();
+}
+
+function renderRemote(): void {
+    remoteBox.hidden = !remoteOn;
+    toggleRemoteBtn.setAttribute('aria-pressed', String(remoteOn));
+    toggleRemoteBtn.classList.toggle('is-on', remoteOn);
+}
 
 // ---------- 表示 ----------
 
@@ -245,7 +285,10 @@ function selectChannel(id: string, announce: boolean): void {
     const changed = id !== current;
     current = id;
     store.set('channel', id);
-    if (changed) player.load(streamUrl(id));
+    if (changed) {
+        player.load(streamUrl(id));
+        restartData();
+    }
     renderChannels();
     renderNow();
     if (announce && syncInput.checked && ws?.readyState === WebSocket.OPEN && room?.channel !== id) {
@@ -318,6 +361,7 @@ function setupControls(qualities: string[]): void {
         quality = qualitySelect.value;
         store.set('quality', quality);
         if (current) player.load(streamUrl(current));
+        restartData();
     });
 
     const savedVolume = Number(store.get('volume') ?? '1');
@@ -354,6 +398,57 @@ function setupControls(qualities: string[]): void {
         else document.body.classList.toggle('list-hidden');
     });
 
+    // データ放送のリモコン
+    remoteDigits.replaceChildren(
+        ...[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map(n => {
+            const b = document.createElement('button');
+            b.className = 'rk';
+            b.textContent = String(n);
+            // 10 は「0」としても使われる。11・12 はそのままのキー
+            b.dataset.key = String(Key.Digit0 + n);
+            return b;
+        }),
+    );
+    remoteBox.addEventListener('click', e => {
+        const button = (e.target as HTMLElement).closest<HTMLButtonElement>('button[data-key]');
+        if (button) data.press(Number(button.dataset.key));
+    });
+    toggleRemoteBtn.addEventListener('click', () => {
+        remoteOn = !remoteOn;
+        store.set('remote', remoteOn ? '1' : '0');
+        renderRemote();
+        restartData();
+        if (remoteOn) {
+            document.body.classList.remove('list-hidden');
+            if (window.matchMedia('(max-width: 760px)').matches) sidebar.classList.add('is-open');
+        }
+    });
+    renderRemote();
+
+    const KEYBOARD: Record<string, number> = {
+        ArrowUp: Key.Up,
+        ArrowDown: Key.Down,
+        ArrowLeft: Key.Left,
+        ArrowRight: Key.Right,
+        Enter: Key.Enter,
+        Backspace: Key.Back,
+        d: Key.Data,
+        b: Key.Blue,
+        r: Key.Red,
+        g: Key.Green,
+        y: Key.Yellow,
+    };
+    window.addEventListener('keydown', e => {
+        if (!data.running || e.ctrlKey || e.metaKey || e.altKey) return;
+        const target = e.target as HTMLElement;
+        if (target.closest('input, select, textarea, button, [role="button"]')) return;
+        const name = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+        const key = /^[0-9]$/.test(name) ? Key.Digit0 + Number(name) : KEYBOARD[name];
+        if (key === undefined) return;
+        e.preventDefault();
+        data.press(key);
+    });
+
     // 操作がないときはバーを隠して映像だけにする
     let idleTimer: number | undefined;
     const wake = () => {
@@ -364,6 +459,8 @@ function setupControls(qualities: string[]): void {
         }, 3500);
     };
     for (const type of ['pointermove', 'pointerdown', 'keydown'] as const) stage.addEventListener(type, wake);
+    // 再生が始まった時点から数え直す (読み込み中に時間切れになると隠れないままになる)
+    video.addEventListener('playing', wake);
     wake();
 }
 

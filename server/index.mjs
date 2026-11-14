@@ -28,7 +28,8 @@ if (DEV_NO_AUTH && HOST !== '127.0.0.1') {
 const QUALITIES = ['1080p', '720p', '540p', '480p', '360p', '240p'];
 const CHANNEL_ID_RE = /^[a-z0-9]{2,8}(-[0-9]{1,2})?$/;
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
-const MAX_STREAMS_PER_SESSION = 2;
+// 映像とデータ放送で 1 人 2 本。チャンネル切り替え中は一時的に倍になる
+const MAX_STREAMS_PER_SESSION = 6;
 const DIST = join(dirname(fileURLToPath(import.meta.url)), '..', 'client', 'dist');
 
 /** @type {Map<string, {user: {id: string, name: string, avatar: string | null}, exp: number, streams: number}>} */
@@ -177,6 +178,7 @@ async function handleChannels(res) {
                     type,
                     name: c.name,
                     number: c.channel_number,
+                    service_id: c.service_id,
                     is_radio: c.is_radiochannel,
                     viewers: c.viewer_count,
                     present: pickProgram(c.program_present),
@@ -204,7 +206,11 @@ async function handleLogo(res, id) {
     res.end(buf);
 }
 
-async function handleStream(req, res, session, id, quality) {
+/**
+ * KonomiTV の終わりのないレスポンスをそのまま流す。
+ * kind: 'mpegts' は映像、'psi-archived-data' はデータ放送 (d ボタン) の元データ。
+ */
+async function handleStream(req, res, session, id, quality, kind = 'mpegts') {
     if (session.streams >= MAX_STREAMS_PER_SESSION) return sendJson(res, 429, { error: 'too_many_streams' });
     session.streams++;
     const ac = new AbortController();
@@ -217,20 +223,21 @@ async function handleStream(req, res, session, id, quality) {
     };
     res.on('close', release);
     try {
-        const up = await fetch(`${KONOMITV_URL}/api/streams/live/${id}/${quality}/mpegts`, { signal: ac.signal });
+        const up = await fetch(`${KONOMITV_URL}/api/streams/live/${id}/${quality}/${kind}`, { signal: ac.signal });
         if (!up.ok || !up.body) {
             release();
             return sendJson(res, 502, { error: 'konomitv_error', status: up.status });
         }
-        log('stream start', session.user.name, id, quality);
+        const isVideo = kind === 'mpegts';
+        log(isVideo ? 'stream start' : 'data start', session.user.name, id, quality);
         res.writeHead(200, {
-            'Content-Type': 'video/mp2t',
+            'Content-Type': isVideo ? 'video/mp2t' : 'application/octet-stream',
             'Cache-Control': 'no-store, no-transform',
             'X-Accel-Buffering': 'no',
         });
         const body = Readable.fromWeb(up.body);
         body.on('error', () => res.destroy());
-        body.on('end', () => log('stream end', session.user.name, id, quality));
+        if (isVideo) body.on('end', () => log('stream end', session.user.name, id, quality));
         body.pipe(res);
     } catch (e) {
         release();
@@ -317,6 +324,10 @@ const server = createServer(async (req, res) => {
         m = path.match(/^\/api\/stream\/([^/]+)\/([^/]+)$/);
         if (m && CHANNEL_ID_RE.test(m[1]) && QUALITIES.includes(m[2])) {
             return await handleStream(req, res, session, m[1], m[2]);
+        }
+        m = path.match(/^\/api\/psi\/([^/]+)\/([^/]+)$/);
+        if (m && CHANNEL_ID_RE.test(m[1]) && QUALITIES.includes(m[2])) {
+            return await handleStream(req, res, session, m[1], m[2], 'psi-archived-data');
         }
         sendJson(res, 404, { error: 'not_found' });
     } catch (e) {

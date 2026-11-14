@@ -5,6 +5,7 @@
 - チャンネル一覧と放送中の番組を表示し、選んだチャンネルのライブ映像を再生します
 - 誰かがチャンネルを変えると、同じアクティビティにいる全員が同じチャンネルに切り替わります（各自でオフにできます）
 - 画質と音量は各自で変えられます
+- データ放送（d ボタン）を表示して、画面上のリモコンやキーボードで操作できます
 - 見られるのは、許可した Discord サーバーのメンバーか、許可したユーザーだけです
 
 KonomiTV 本体には手を入れません。このアプリが KonomiTV の API とライブ映像を中継します。
@@ -73,19 +74,24 @@ docker compose up -d --build
 
 - **画質ごとにエンコードが 1 本走ります**。同じチャンネル・同じ画質の視聴者は 1 本を共有するので、みんなで 720p のままにしておくのが軽いです
 - 再生には Media Source Extensions が必要です。PC 版 Discord とブラウザ版で動きます。モバイル版は端末によって再生できないことがあります
+- データ放送は操作バーの「d」でリモコンを開くと読み込みます。操作は各自の画面だけに反映され、他の人とは同期しません。キーボードでは矢印・Enter・Backspace（戻る）・D・B/R/G/Y（色ボタン）・数字が使えます
+- データ放送のうち、通信を使う機能（投票など）と郵便番号に依存する表示（地域の天気など）は動きません
 - 録画番組の再生、実況コメント、字幕にはまだ対応していません
 - テレビ放送を不特定の人に見せると著作権（公衆送信権）の問題になります。視聴を許可する範囲は自分と身内にとどめてください
 
 ## 開発
 
 ```sh
-npm install && npm --prefix client install
+npm install && npm --prefix client install --allow-remote=all
 npm run build
 DEV_NO_AUTH=1 npm start   # http://127.0.0.1:7100 を普通のブラウザで開ける
 ```
 
 `DEV_NO_AUTH=1` は Discord の認証を飛ばす開発用の設定で、`HOST=127.0.0.1` のときしか有効になりません。
 
+データ放送の表示に使う [web-bml](https://github.com/otya128/web-bml) が、依存の 1 つを GitHub の配布ファイルから取得します。npm 12 以降は既定でこれを止めるので、`--allow-remote=all` が必要です。
+
 ## ライセンス
 
-MIT License。KonomiTV は tsukumijima 氏によるソフトウェアで、このリポジトリは非公式の周辺ツールです。
+MIT License。データ放送の解読処理は KonomiTV（MIT License）の実装を移植したものです。`client/public/fonts/` の Kosugi / Kosugi Maru は Apache License 2.0 で配布されているフォントです。
+KonomiTV は tsukumijima 氏によるソフトウェアで、このリポジトリは非公式の周辺ツールです。

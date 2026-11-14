@@ -35,6 +35,7 @@
             <span>みんなと同じチャンネル</span>
           </label>
           <select class="select" id="quality" aria-label="画質"></select>
+          <button class="icon-btn icon-btn--d" id="toggle-remote" title="データ放送 (d ボタン)" aria-pressed="false">d</button>
           <button class="icon-btn" id="toggle-list" title="チャンネル一覧">☰</button>
         </footer>
       </main>
@@ -42,6 +43,27 @@
       <aside class="sidebar" id="sidebar">
         <div class="sidebar__head">チャンネル</div>
         <ul class="channels" id="channels"></ul>
+        <section class="remote" id="remote" hidden aria-label="データ放送のリモコン">
+          <div class="remote__status" id="remote-status"></div>
+          <div class="remote__row">
+            <button class="rk rk--d" data-key="20" title="キーボード: D">d データ</button>
+            <button class="rk" data-key="19" title="キーボード: Backspace">戻る</button>
+          </div>
+          <div class="remote__row remote__colors">
+            <button class="rk rk--blue" data-key="21" title="キーボード: B">青</button>
+            <button class="rk rk--red" data-key="22" title="キーボード: R">赤</button>
+            <button class="rk rk--green" data-key="23" title="キーボード: G">緑</button>
+            <button class="rk rk--yellow" data-key="24" title="キーボード: Y">黄</button>
+          </div>
+          <div class="remote__pad">
+            <button class="rk" data-key="1" style="grid-area: up" aria-label="上">▲</button>
+            <button class="rk" data-key="3" style="grid-area: left" aria-label="左">◀</button>
+            <button class="rk rk--enter" data-key="18" style="grid-area: enter">決定</button>
+            <button class="rk" data-key="4" style="grid-area: right" aria-label="右">▶</button>
+            <button class="rk" data-key="2" style="grid-area: down" aria-label="下">▼</button>
+          </div>
+          <div class="remote__digits" id="remote-digits"></div>
+        </section>
       </aside>
     </div>
     <script type="module" src="/src/main.ts"></script>
